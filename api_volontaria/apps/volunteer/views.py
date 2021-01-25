@@ -1,9 +1,22 @@
+import json
+from io import TextIOWrapper
+
+from django.urls import reverse
 from django_filters.rest_framework import DjangoFilterBackend
 from dry_rest_permissions.generics import DRYPermissions, \
     DRYPermissionFiltersBase
-from rest_framework import viewsets
-from rest_framework.permissions import IsAdminUser
 
+from rest_framework import viewsets, status
+from rest_framework.decorators import action
+from rest_framework.parsers import JSONParser, FormParser, MultiPartParser
+from rest_framework.permissions import IsAdminUser
+from rest_framework.response import Response
+
+from api_volontaria.apps.volunteer.helpers import (
+    InvalidBulkUpdate,
+    add_bulk_from_file,
+    AddBulkConfig
+)
 from api_volontaria.apps.volunteer.models import (
     Cell,
     Event,
@@ -60,6 +73,7 @@ class EventViewSet(viewsets.ModelViewSet):
         'cell': ['exact'],
     }
     permission_classes = (DRYPermissions, DjangoFilterBackend)
+    parser_classes = (JSONParser, FormParser, MultiPartParser)
 
     def get_permissions(self):
         if self.action in ['list']:
@@ -68,6 +82,54 @@ class EventViewSet(viewsets.ModelViewSet):
             permission_classes = [IsAdminUser]
 
         return [permission() for permission in permission_classes]
+
+    @action(detail=False, methods=['post'])
+    def bulk(self, request):
+        """
+        Bulk add of events using a file
+        """
+        file_data_bytes = request.data.get("file", None)
+        if not file_data_bytes:
+            return Response(
+                {'file': ["No file was provided for bulk event creation"]},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            mapping = json.loads(request.data.get("mapping", "{}"))
+        except ValueError as e:
+            message = {
+                "mapping":
+                    [f"Mapping should be a dictionary "
+                     f"represented in json, errors: {e}"]
+            }
+            return Response(message, status=status.HTTP_400_BAD_REQUEST)
+
+        if not isinstance(mapping, dict):
+            message = {
+                "mapping":
+                    ["Mapping should be a dictionary pairing the "
+                     "csv column (key) to the element key (value)"]
+            }
+            return Response(message, status=status.HTTP_400_BAD_REQUEST)
+
+        config = AddBulkConfig(
+            EventSerializer,
+            request.data.get("format", "csv"),
+            mapping
+        )
+
+        file_data = TextIOWrapper(file_data_bytes, encoding='utf-8')
+        try:
+            ids = add_bulk_from_file(file_data, config)
+        except InvalidBulkUpdate as e:
+            return Response(
+                {"non_field_errors": [e.error]},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        url_ids = [reverse('event-detail', kwargs={'pk': id_}) for id_ in ids]
+        return Response({"created": url_ids}, status=status.HTTP_201_CREATED)
 
 
 class ParticipationFilterBackend(DRYPermissionFiltersBase):

@@ -1,9 +1,12 @@
 import json
+from io import BytesIO
+from unittest.mock import patch
 
 from rest_framework import status
 from rest_framework.test import APIClient, APIRequestFactory
 from django.urls import reverse
 
+from api_volontaria.apps.volunteer.helpers import InvalidBulkUpdate
 from api_volontaria.apps.volunteer.models import (
     Event,
     Cell,
@@ -260,3 +263,145 @@ class EventsTests(CustomAPITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(content['results']), 1)
         self.check_attributes(content['results'][0])
+
+    def test_bulk_events_as_users(self):
+        """
+        Ensure we can't bulk add events if we are a simple user.
+        :return:
+        """
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.post(
+            reverse('event-bulk'),
+            data={'file': BytesIO()},
+            format='multipart'
+        )
+
+        content = json.loads(response.content)
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(
+            content,
+            {'detail': 'You do not have permission to perform this action.'}
+        )
+
+    def test_bulk_events_no_file_is_given(self):
+        """
+        Ensure bad request with explanation is returned if no file
+        is given as input
+        """
+        self.client.force_authenticate(user=self.admin)
+
+        response = self.client.post(
+            reverse('event-bulk'),
+            data={},
+            format='multipart'
+        )
+
+        content = json.loads(response.content)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            content,
+            {'file': ["No file was provided for bulk event creation"]}
+        )
+
+    def test_bulk_events_mapping_is_not_valid_json(self):
+        """
+        Ensure bad request with explanation is returned if mapping
+        is not a valid json string
+        """
+        self.client.force_authenticate(user=self.admin)
+
+        invalid_json = '{"detail": "extra bracket at the end "}}'
+        response = self.client.post(
+            reverse('event-bulk'),
+            data={
+                "file": BytesIO(),
+                "mapping": invalid_json
+            },
+            format='multipart'
+        )
+
+        content = json.loads(response.content)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            "Mapping should be a dictionary represented in json, errors",
+            content["mapping"][0]
+        )
+
+    def test_bulk_events_mapping_is_not_a_dict(self):
+        """
+        Ensure bad request with explanation is returned if mapping
+        is not a json string representing a dictionary
+        """
+        self.client.force_authenticate(user=self.admin)
+
+        response = self.client.post(
+            reverse('event-bulk'),
+            data={
+                "file": BytesIO(),
+                "mapping": '["list instead of dict"]'
+            },
+            format='multipart'
+        )
+
+        content = json.loads(response.content)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            content,
+            {
+                "mapping":
+                    ["Mapping should be a dictionary pairing the "
+                     "csv column (key) to the element key (value)"]
+            }
+        )
+
+    @patch("api_volontaria.apps.volunteer.views.add_bulk_from_file")
+    def test_bulk_events_adding_fail(self, add_bulk_from_file):
+        """
+        Ensure bad request with the caught errors is returned
+        if the bulk operation fails
+        """
+        self.client.force_authenticate(user=self.admin)
+
+        error_message = "error message from add_bulk"
+        add_bulk_from_file.side_effect = InvalidBulkUpdate(
+            error_message
+        )
+
+        response = self.client.post(
+            reverse('event-bulk'),
+            data={"file": BytesIO()},
+            format='multipart'
+        )
+
+        content = json.loads(response.content)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(content, {'non_field_errors': [error_message]})
+
+    @patch("api_volontaria.apps.volunteer.views.add_bulk_from_file")
+    def test_bulk_events_successful(self, add_bulk_from_file):
+        """
+        Ensure 201 created with the created ids is returned
+        if the bulk operation succeeds
+        """
+        self.client.force_authenticate(user=self.admin)
+
+        ids = [4, 56, 89]
+        add_bulk_from_file.return_value = ids
+
+        response = self.client.post(
+            reverse('event-bulk'),
+            data={"file": BytesIO()},
+            format='multipart'
+        )
+
+        content = json.loads(response.content)
+        url_ids = [reverse('event-detail',  kwargs={'pk': id_}) for id_ in ids]
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(content, {'created': url_ids})
